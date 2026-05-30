@@ -31,6 +31,8 @@ class Player(xbmc.Player):
 
     def __init__(self):
         xbmc.Player.__init__(self)
+        self._segment_thread = None
+        self._segment_thread_active = False
 
     def get_playing_file(self):
         try:
@@ -103,8 +105,6 @@ class Player(xbmc.Player):
         window("jellyfin_play.json", items)
 
         self.set_item(current_file, item)
-        # Detect current audio/subtitle state from Kodi player
-        self.detect_audio_subs(item)
         data = {
             "QueueableMediaTypes": "Video,Audio",
             "CanSeek": True,
@@ -133,6 +133,11 @@ class Player(xbmc.Player):
                 self.check_skip_segments(item, current_pos)
             except Exception:
                 pass  # Player may not be ready yet
+
+            try:
+                self._start_segment_monitor(item)
+            except Exception as e:
+                LOG.warning("Failed to start segment monitor thread: %s", e)
 
         if monitor.waitForAbort(2):
             return
@@ -428,6 +433,11 @@ class Player(xbmc.Player):
 
     def stop_playback(self):
         """Stop all playback. Check for external player for positionticks."""
+        try:
+            self._stop_segment_monitor()
+        except Exception as e:
+            LOG.warning("Failed to stop segment monitor thread: %s", e)
+
         if not self.played:
             return
 
@@ -623,65 +633,18 @@ class Player(xbmc.Player):
             return 0
         return int(settings(setting_key) or 0)
 
-    def _get_runtime_for_seek(self):
-        try:
-            total_time = float(self.getTotalTime())
-            if total_time > 0:
-                return total_time
-        except Exception:
-            pass
-
-        try:
-            current_file = self.get_playing_file()
-            if current_file and self.is_playing_file(current_file):
-                item = self.get_file_info(current_file)
-                runtime = float(item.get("Runtime") or 0)
-                if runtime > 0:
-                    return runtime
-        except Exception:
-            pass
-
-        return 0.0
-
-    def _get_safe_seek_time(self, seek_time, margin=1.0):
-        try:
-            safe_seek_time = max(0.0, float(seek_time))
-        except (TypeError, ValueError):
-            return None
-
-        runtime = self._get_runtime_for_seek()
-        if runtime > 0:
-            max_seek_time = runtime - margin
-            if max_seek_time <= 0:
-                max_seek_time = runtime
-            safe_seek_time = min(safe_seek_time, max_seek_time)
-
-        try:
-            current_position = float(self.getTime())
-            if safe_seek_time <= current_position:
-                return None
-        except Exception:
-            pass
-
-        return safe_seek_time
-
     def _handle_skip_segment(self, segment_type, start, end, mode):
-        safe_end = self._get_safe_seek_time(end)
-        if safe_end is None or safe_end <= start:
-            return
-
         LOG.debug(
-            "_handle_skip_segment: type=%s, mode=%d, start=%.1f, end=%.1f, safe_end=%.1f",
+            "_handle_skip_segment: type=%s, mode=%d, start=%.1f, end=%.1f",
             segment_type,
             mode,
             start,
             end,
-            safe_end,
         )
 
         if mode == 1:  # Auto skip
-            self.seekTime(safe_end)
-            LOG.info("Auto-skipped %s to %.1f", segment_type, safe_end)
+            self.seekTime(end)
+            LOG.info("Auto-skipped %s to %.1f", segment_type, end)
             # Show notification
             message = "Skipped %s" % segment_type
             dialog(
@@ -693,7 +656,7 @@ class Player(xbmc.Player):
             )
 
         elif mode == 2:  # Show skip button
-            self._show_skip_button(segment_type, safe_end - start, safe_end)
+            self._show_skip_button(segment_type, end - start, end)
 
     def _show_skip_button(self, segment_type, duration, end_time):
         LOG.debug(
@@ -735,6 +698,7 @@ class Player(xbmc.Player):
         """Monitor the skip dialog and handle user input or timeout."""
         LOG.debug("_monitor_skip_dialog: starting, end_time=%.1f", self._skip_end_time)
         monitor = xbmc.Monitor()
+        last_remaining = -1
 
         # Monitor loop - check for user input or end of segment
         while self.skip_dialog and not monitor.abortRequested():
@@ -758,7 +722,14 @@ class Player(xbmc.Player):
                         self._skip_end_time,
                     )
                     break
-            except Exception:
+
+                # Dynamic countdown update
+                remaining = int(self._skip_end_time - current_pos)
+                if remaining != last_remaining:
+                    self.skip_dialog.update_duration(remaining)
+                    last_remaining = remaining
+            except Exception as e:
+                LOG.debug("_monitor_skip_dialog error: %s", e)
                 break
 
             if monitor.waitForAbort(0.2):
@@ -771,3 +742,37 @@ class Player(xbmc.Player):
             except Exception:
                 pass
             self.skip_dialog = None
+
+    def _start_segment_monitor(self, item):
+        if not settings("mediaSegmentsEnabled.bool"):
+            return
+        self._stop_segment_monitor()
+        self._segment_thread_active = True
+        import threading
+        self._segment_thread = threading.Thread(
+            target=self._monitor_segments_loop,
+            args=(item,),
+            name="JellyfinSegmentMonitor"
+        )
+        self._segment_thread.daemon = True
+        self._segment_thread.start()
+        LOG.debug("Segment monitor thread started")
+
+    def _stop_segment_monitor(self):
+        self._segment_thread_active = False
+        self._segment_thread = None
+
+    def _monitor_segments_loop(self, item):
+        monitor = xbmc.Monitor()
+        while self._segment_thread_active and not monitor.abortRequested():
+            if not self.isPlaying():
+                break
+            try:
+                if self.isPlayingVideo() and not self.getTime() == 0:
+                    if not self.skip_dialog:
+                        current_pos = int(self.getTime())
+                        self.check_skip_segments(item, current_pos)
+            except Exception as e:
+                LOG.debug("Error in segment monitor loop: %s", e)
+            if monitor.waitForAbort(1):
+                break
